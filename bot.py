@@ -1,8 +1,12 @@
 """
-TikTok Downloader Telegram Bot
-• Скачивает видео, аудио и изображения из TikTok без водяного знака
-• Custom emoji через MessageEntity (entities-подход, без HTML-тегов)
-• Автоустановка ffmpeg на ограниченных хостингах
+TikTok Downloader Telegram Bot  —  финальная версия
+====================================================
+• Скачивает видео + аудио + изображения ОДНОВРЕМЕННО (asyncio.gather)
+• Custom emoji через MessageEntity — видны всем пользователям
+  (бот может отправлять их, если владелец бота подписан на Telegram Premium)
+• Автоустановка ffmpeg на ограниченных хостингах (без root/apt)
+• Все временные файлы удаляются через try/finally
+
 Зависимости: aiogram 3.x, yt-dlp, python-dotenv
 """
 
@@ -23,24 +27,17 @@ import yt_dlp
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command
-from aiogram.types import (
-    CallbackQuery,
-    FSInputFile,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Message,
-    MessageEntity,
-)
+from aiogram.types import FSInputFile, Message, MessageEntity
 from dotenv import load_dotenv
 
-# ──────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────
 # Загрузка .env
-# ──────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────
 load_dotenv()
 
-# ──────────────────────────────────────────────
-# Конфигурация из .env
-# ──────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────
+# Конфигурация
+# ──────────────────────────────────────────────────────────
 BOT_TOKEN: str        = os.getenv("BOT_TOKEN", "")
 MAX_FILE_SIZE_MB: int = int(os.getenv("MAX_FILE_SIZE_MB", "50"))
 MAX_FILE_SIZE_BYTES   = MAX_FILE_SIZE_MB * 1024 * 1024
@@ -53,19 +50,19 @@ FFMPEG_LOCAL = Path("bin") / ("ffmpeg.exe" if platform.system() == "Windows" els
 if _FFMPEG_ENV:
     FFMPEG_PATH: str = _FFMPEG_ENV
 elif shutil.which("ffmpeg"):
-    FFMPEG_PATH = shutil.which("ffmpeg")  # type: ignore[assignment]
+    FFMPEG_PATH = shutil.which("ffmpeg")          # type: ignore[assignment]
 else:
     FFMPEG_PATH = str(FFMPEG_LOCAL)
 
 if not BOT_TOKEN:
     sys.exit(
-        "[FATAL] BOT_TOKEN не задан!\n"
+        "[FATAL] BOT_TOKEN не задан.\n"
         "Создай файл .env и добавь: BOT_TOKEN=ваш_токен_здесь"
     )
 
-# ──────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────
 # Логирование
-# ──────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
@@ -73,26 +70,27 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ──────────────────────────────────────────────
-# Рабочие директории
-# ──────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────
+# Директории
+# ──────────────────────────────────────────────────────────
 TEMP_DIR.mkdir(exist_ok=True)
 FFMPEG_LOCAL.parent.mkdir(exist_ok=True)
 
 
-# ══════════════════════════════════════════════
-# БЛОК 1: Автоустановка FFmpeg
+# ══════════════════════════════════════════════════════════
+# БЛОК 1 — Автоустановка FFmpeg
 #
-# Скачивает статический бинарник без зависимостей
-# в ./bin/ffmpeg — работает без root и apt.
+# Нужен для хостингов без root-доступа (Railway, Render,
+# обычные VPS без apt). Скачивает статический GPL-бинарник
+# в ./bin/ffmpeg — без системных зависимостей.
 #
-# Платформы:
-#   Linux  x86_64  — большинство VPS / Railway / Render
-#   Linux  aarch64 — ARM (Oracle Free Tier)
-#   Windows x64    — локальная разработка
-# ══════════════════════════════════════════════
+# Поддерживаемые платформы:
+#   Linux  x86_64   — большинство VPS
+#   Linux  aarch64  — ARM (Oracle Free Tier и др.)
+#   Windows AMD64   — локальная разработка
+# ══════════════════════════════════════════════════════════
 
-_FFMPEG_RELEASES: dict[str, dict[str, str]] = {
+_FFMPEG_URLS: dict[str, dict[str, str]] = {
     "Linux": {
         "x86_64": (
             "https://github.com/yt-dlp/FFmpeg-Builds/releases/download/"
@@ -109,91 +107,84 @@ _FFMPEG_RELEASES: dict[str, dict[str, str]] = {
             "latest/ffmpeg-master-latest-win64-gpl.zip"
         ),
     },
-    "Darwin": {},  # macOS: brew install ffmpeg
+    "Darwin": {},   # macOS: brew install ffmpeg
 }
 
 
-def _dl_progress(blocks: int, block_size: int, total: int) -> None:
+def _progress(blocks: int, bs: int, total: int) -> None:
     if total > 0:
-        pct = min(blocks * block_size * 100 // total, 100)
-        mb = blocks * block_size / 1024 / 1024
-        print(f"\r  [{pct:3d}%] {mb:.1f} МБ", end="", flush=True)
+        pct = min(blocks * bs * 100 // total, 100)
+        print(f"\r  [{pct:3d}%] {blocks * bs / 1048576:.1f} MB", end="", flush=True)
 
 
 def install_ffmpeg() -> bool:
-    """Скачивает ffmpeg в ./bin/ffmpeg. Возвращает True при успехе."""
-    system  = platform.system()
-    machine = platform.machine()
-    url     = _FFMPEG_RELEASES.get(system, {}).get(machine)
-
+    """Скачивает ffmpeg-бинарник в ./bin/ffmpeg. True = успех."""
+    system, machine = platform.system(), platform.machine()
+    url = _FFMPEG_URLS.get(system, {}).get(machine)
     if not url:
         logger.warning(f"Автоустановка ffmpeg не поддерживается для {system}/{machine}")
         return False
 
-    suffix       = ".zip" if system == "Windows" else ".tar.xz"
-    archive_path = Path("bin") / f"ffmpeg_tmp{suffix}"
+    ext    = ".zip" if system == "Windows" else ".tar.xz"
+    tmp    = Path("bin") / f"ffmpeg_tmp{ext}"
+    target = FFMPEG_LOCAL
 
     logger.info(f"Скачиваю ffmpeg ({system}/{machine})...")
     try:
-        urllib.request.urlretrieve(url, archive_path, reporthook=_dl_progress)
+        urllib.request.urlretrieve(url, tmp, reporthook=_progress)
         print()
 
         if system == "Windows":
-            with zipfile.ZipFile(archive_path, "r") as zf:
+            with zipfile.ZipFile(tmp, "r") as zf:
                 for m in zf.namelist():
                     if m.endswith("/ffmpeg.exe") or m == "ffmpeg.exe":
-                        FFMPEG_LOCAL.write_bytes(zf.read(m))
-                        break
+                        target.write_bytes(zf.read(m)); break
                 else:
-                    raise FileNotFoundError("ffmpeg.exe не найден в ZIP")
+                    raise FileNotFoundError("ffmpeg.exe не найден в архиве")
         else:
             import tarfile
-            with tarfile.open(archive_path, "r:xz") as tf:
+            with tarfile.open(tmp, "r:xz") as tf:
                 for m in tf.getmembers():
                     if Path(m.name).name == "ffmpeg" and m.isfile():
-                        f = tf.extractfile(m)
-                        if f:
-                            FFMPEG_LOCAL.write_bytes(f.read())
+                        fobj = tf.extractfile(m)
+                        if fobj:
+                            target.write_bytes(fobj.read())
                         break
                 else:
-                    raise FileNotFoundError("ffmpeg не найден в TAR")
-            FFMPEG_LOCAL.chmod(
-                FFMPEG_LOCAL.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
-            )
+                    raise FileNotFoundError("ffmpeg не найден в архиве")
+            target.chmod(target.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
-        r = subprocess.run([str(FFMPEG_LOCAL), "-version"], capture_output=True, timeout=15)
+        r = subprocess.run([str(target), "-version"], capture_output=True, timeout=15)
         if r.returncode != 0:
-            raise RuntimeError("ffmpeg smoke-test не прошёл")
+            raise RuntimeError("smoke-test провалился")
 
-        logger.info(f"FFmpeg установлен: {FFMPEG_LOCAL.resolve()}")
+        logger.info(f"FFmpeg установлен: {target.resolve()}")
         return True
 
     except Exception as e:
         logger.error(f"Ошибка установки ffmpeg: {e}")
         return False
     finally:
-        if archive_path.exists():
-            archive_path.unlink(missing_ok=True)
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
 
 
 def ensure_ffmpeg() -> None:
     """
     Гарантирует наличие ffmpeg.
-    Порядок: .env → PATH → ./bin/ffmpeg (кэш) → авто-загрузка → exit
+    Порядок: .env → системный PATH → ./bin/ffmpeg (кэш) → авто-загрузка → exit
     """
     global FFMPEG_PATH
 
-    resolved = shutil.which(FFMPEG_PATH) or (
-        FFMPEG_PATH if Path(FFMPEG_PATH).is_file() else None
-    )
+    resolved = shutil.which(FFMPEG_PATH) or (FFMPEG_PATH if Path(FFMPEG_PATH).is_file() else None)
     if resolved:
-        logger.info(f"FFmpeg: {resolved}")
         FFMPEG_PATH = resolved
+        logger.info(f"FFmpeg: {FFMPEG_PATH}")
         return
 
     if FFMPEG_LOCAL.is_file():
-        logger.info(f"FFmpeg (локальный): {FFMPEG_LOCAL.resolve()}")
         FFMPEG_PATH = str(FFMPEG_LOCAL.resolve())
+        logger.info(f"FFmpeg (локальный): {FFMPEG_PATH}")
         return
 
     logger.warning("FFmpeg не найден — запускаю автоустановку...")
@@ -202,322 +193,249 @@ def ensure_ffmpeg() -> None:
         return
 
     sys.exit(
-        "\n[FATAL] FFmpeg не найден и не удалось установить.\n"
+        "\n[FATAL] FFmpeg не найден и установить не удалось.\n"
         "  Ubuntu/Debian : sudo apt install ffmpeg\n"
         "  macOS         : brew install ffmpeg\n"
-        "  Вручную       : FFMPEG_PATH=/path/to/ffmpeg в .env\n"
+        "  Вручную       : укажи путь в .env через FFMPEG_PATH=\n"
     )
 
 
-# ══════════════════════════════════════════════
-# БЛОК 2: Построитель текста с entities
+# ══════════════════════════════════════════════════════════
+# БЛОК 2 — Построитель сообщений с MessageEntity
 #
-# Вместо HTML-тегов (<b>, <tg-emoji>) используем
-# MessageEntity напрямую. Это самый надёжный способ
-# по Bot API — не зависит от парсера разметки.
+# Все пользователи видят custom emoji (animated/static),
+# отправлять их от имени бота можно при наличии Telegram
+# Premium у владельца бота (Bot API обновление 09.02.2026).
 #
-# Offset/length считаются в UTF-16 code units:
-#   BMP-символы (ASCII, кирилл., базовые emoji) → 1 unit
-#   Supplementary plane (большинство цветных emoji) → 2 units
-# ══════════════════════════════════════════════
+# Offset/length — в UTF-16 code units, как требует Bot API.
+# BMP-символы (ASCII, кирилл., базовые emoji) = 1 unit.
+# Supplementary plane (большинство цветных emoji) = 2 units.
+# ══════════════════════════════════════════════════════════
 
-def _utf16(s: str) -> int:
-    """Длина строки в UTF-16 code units (как считает Telegram)."""
+def _u16len(s: str) -> int:
+    """Длина строки в UTF-16 code units."""
     return len(s.encode("utf-16-le")) // 2
 
 
 class Msg:
     """
-    Построитель сообщений с поддержкой форматирования и custom emoji.
+    Построитель сообщений через MessageEntity.
+    Не использует parse_mode вообще — только entities.
 
-    Использование:
-        m = Msg().emoji(CE_DONE).bold(" Готово!").nl().text("Вот файл")
-        await message.answer(**m.build())
+    Пример:
+        m = Msg().ce(CE_DONE, "✅").bold(" Готово!").nl().text("Вот твой файл")
+        await message.answer(**m.out())
+        await message.answer_video(..., **m.cap())
     """
-    __slots__ = ("_text", "_entities")
 
     def __init__(self) -> None:
-        self._text     = ""
-        self._entities: list[MessageEntity] = []
+        self._buf: str = ""
+        self._ent: list[MessageEntity] = []
 
-    # ── Утилиты ────────────────────────────────
-    def _offset(self) -> int:
-        return _utf16(self._text)
+    def _off(self) -> int:
+        return _u16len(self._buf)
 
-    def _add(self, s: str, entity_type: str, **kwargs) -> "Msg":
-        self._entities.append(
-            MessageEntity(type=entity_type, offset=self._offset(), length=_utf16(s), **kwargs)
-        )
-        self._text += s
+    def _push(self, s: str, t: str, **kw) -> "Msg":
+        self._ent.append(MessageEntity(type=t, offset=self._off(), length=_u16len(s), **kw))
+        self._buf += s
         return self
 
-    # ── Форматирование ──────────────────────────
-    def text(self, s: str) -> "Msg":
-        """Обычный текст (без форматирования)."""
-        self._text += s
-        return self
+    # ── Базовые методы ─────────────────────────
+    def text(self, s: str)  -> "Msg": self._buf += s;          return self
+    def bold(self, s: str)  -> "Msg": return self._push(s, "bold")
+    def code(self, s: str)  -> "Msg": return self._push(s, "code")
+    def nl(self, n: int = 1)-> "Msg": self._buf += "\n" * n;  return self
 
-    def bold(self, s: str) -> "Msg":
-        return self._add(s, "bold")
-
-    def italic(self, s: str) -> "Msg":
-        return self._add(s, "italic")
-
-    def code(self, s: str) -> "Msg":
-        return self._add(s, "code")
-
-    def nl(self, n: int = 1) -> "Msg":
-        self._text += "\n" * n
-        return self
-
-    # ── Custom emoji ────────────────────────────
-    def emoji(self, emoji_id: str, placeholder: str = "●") -> "Msg":
+    def ce(self, emoji_id: str, placeholder: str) -> "Msg":
         """
-        Вставляет custom emoji по ID.
-        placeholder — любой одиночный символ/emoji:
-          • виден пользователям без Premium как fallback
-          • должен быть ровно один "character" (Unicode scalar)
+        Custom emoji по ID.
+        placeholder — стандартный emoji, ассоциированный с этим стикером
+        (показывается в системных уведомлениях и там, где анимация недоступна).
+        Должен быть ровно один Unicode-скаляр.
         """
-        return self._add(placeholder, "custom_emoji", custom_emoji_id=emoji_id)
+        return self._push(placeholder, "custom_emoji", custom_emoji_id=emoji_id)
 
-    # ── Сборка ──────────────────────────────────
-    def build(self) -> dict:
-        """Возвращает kwargs для message.answer() / bot.send_message()."""
-        return {
-            "text":     self._text,
-            "entities": self._entities or None,
-        }
+    # ── Сборка ─────────────────────────────────
+    def out(self) -> dict:
+        """Kwargs для message.answer()."""
+        return {"text": self._buf, "entities": self._ent or None}
 
-    def build_caption(self) -> dict:
-        """Возвращает kwargs для caption в answer_video / answer_document."""
-        return {
-            "caption":          self._text,
-            "caption_entities": self._entities or None,
-        }
+    def cap(self) -> dict:
+        """Kwargs caption для answer_video / answer_audio / answer_document."""
+        return {"caption": self._buf, "caption_entities": self._ent or None}
 
 
-# ══════════════════════════════════════════════
-# БЛОК 3: Custom Emoji IDs + сообщения бота
-# ══════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════
+# БЛОК 3 — Custom Emoji IDs и тексты сообщений
+#
+# Все тексты строятся через Msg() — ни одного Unicode-emoji
+# в строках нет, только custom emoji через entities.
+# ══════════════════════════════════════════════════════════
 
-# ID кастомных emoji (Premium animated stickers)
+# Идентификаторы custom emoji (animated Premium stickers)
 CE_START    = "6028346797368283073"  # TikTok / музыка
 CE_DOWNLOAD = "5850346984501680054"  # загрузка / ожидание
 CE_DONE     = "5774022692642492953"  # успех / галочка
 CE_ERROR    = "5774077015388852135"  # ошибка / крест
-CE_HELP     = "5938195768832692153"  # помощь / лампочка
+CE_HELP     = "5938195768832692153"  # подсказка / лампочка
 
 
 def msg_start() -> dict:
     return (
         Msg()
-        .emoji(CE_START, "🎵").bold(" Saver").nl(2)
-        .text("Привет! Скинь ссылку прямо сюда, и получи видос ").bold("без водяного знака").text(".").nl(2)
-        .bold("Как использовать:").nl()
-        .text("Просто отправь ссылку на TikTok — выбери формат и получи файл!").nl(2)
-        .text("Видео").text(" → отправлю ").bold(".mp4").nl()
-        .text("Аудио").text(" → отправлю ").bold(".mp3").nl()
-        .text("Карусель").text(" → отправлю ").bold(".zip").text(" архив с фото").nl(2)
-        .text("Отправь /help для подробной инструкции.")
-        .build()
+        .ce(CE_START, "🎵").bold(" Saver").nl(2)
+        .text("Скинь ссылку прямо сюда — получишь видос ")
+        .bold("без водяного знака").text(".").nl(2)
+        .bold("Что пришлю:").nl()
+        .text("Видео ").bold(".mp4").text(" + аудио ").bold(".mp3").nl()
+        .text("Карусель фото ").bold(".zip").text(" + аудио ").bold(".mp3").nl(2)
+        .text("Всё скачивается сразу, без лишних кнопок.").nl(2)
+        .text("Команда /help — подробная инструкция.")
+        .text("Другие проекты - @dreinnh")
+        .out()
     )
 
 
 def msg_help(max_mb: int) -> dict:
     return (
         Msg()
-        .emoji(CE_HELP, "💡").bold(" Инструкция по использованию").nl(2)
-        .bold("Поддерживаемые форматы ссылок:").nl()
-        .code("https://www.tiktok.com/@user/video/123...").nl()
+        .ce(CE_HELP, "💡").bold(" Инструкция").nl(2)
+        .bold("Форматы ссылок:").nl()
+        .code("https://www.tiktok.com/@user/video/123").nl()
         .code("https://vm.tiktok.com/XXXXXXX/").nl()
         .code("https://vt.tiktok.com/XXXXXXX/").nl(2)
-        .bold("Что я умею:").nl()
-        .text("Скачивать видео ").bold("без водяного знака").nl()
-        .text("Извлекать аудио из видео (").bold("MP3").text(")").nl()
-        .text("Скачивать карусели изображений (").bold("ZIP").text(")").nl(2)
+        .bold("Что скачиваю:").nl()
+        .text("Видео без водяного знака").nl()
+        .text("Аудио ").bold("MP3 192kbps").text(" из видео").nl()
+        .text("Карусель изображений в ").bold("ZIP").nl(2)
         .bold("Ограничения:").nl()
-        .text(f"Максимальный размер файла: ").bold(f"{max_mb} МБ").nl()
+        .text("Макс. размер файла: ").bold(f"{max_mb} МБ").nl()
         .text("Приватные видео недоступны").nl(2)
-        .bold("Команды:").nl()
         .code("/start").text(" — приветствие").nl()
-        .code("/help").text(" — эта инструкция").nl(2)
-        .text("Просто отправь ссылку — и готово!")
-        .build()
+        .code("/help").text("  — инструкция")
+        .out()
     )
 
 
-def msg_choose_format() -> dict:
+def msg_downloading() -> dict:
     return (
         Msg()
-        .emoji(CE_DOWNLOAD, "⏳").bold(" Ссылка получена!").nl(2)
-        .text("Выбери что скачать:")
-        .build()
-    )
-
-
-def msg_downloading(action: str) -> dict:
-    label = "аудио" if action == "audio" else "контент"
-    return (
-        Msg()
-        .emoji(CE_DOWNLOAD, "⏳").bold(f" Скачиваю {label}...").text(" Подожди немного.")
-        .build()
+        .ce(CE_DOWNLOAD, "⏳").bold(" Скачиваю...")
+        .text(" Это займёт несколько секунд.")
+        .out()
     )
 
 
 def msg_done_video() -> dict:
-    return (
-        Msg()
-        .emoji(CE_DONE, "✅").bold(" Готово!").text(" Вот твоё видео")
-        .build()
-    )
+    return Msg().ce(CE_DONE, "✅").bold(" Видео готово (by @saver_drbot)").cap()
 
 
 def msg_done_audio() -> dict:
-    return (
-        Msg()
-        .emoji(CE_DONE, "✅").bold(" Готово!").text(" Вот твоё аудио")
-        .build()
-    )
+    return Msg().ce(CE_DONE, "✅").bold(" Аудио готово (by @saver_drbot)").cap()
 
 
 def msg_done_images() -> dict:
-    return (
-        Msg()
-        .emoji(CE_DONE, "✅").bold(" Готово!").text(" Вот архив с изображениями")
-        .build()
-    )
+    return Msg().ce(CE_DONE, "✅").bold(" Фотографии готовы (by @saver_drbot)").cap()
 
 
 def msg_not_tiktok() -> dict:
     return (
         Msg()
-        .emoji(CE_ERROR, "❌").bold(" Неверная ссылка.").nl(2)
-        .text("Я принимаю только ссылки TikTok.").nl()
+        .ce(CE_ERROR, "❌").bold(" Неверная ссылка.").nl(2)
+        .text("Принимаю только ссылки TikTok.").nl()
         .text("Пример: ").code("https://vm.tiktok.com/XXXXXXX/")
-        .build()
+        .out()
     )
 
 
 def msg_too_large(max_mb: int) -> dict:
     return (
         Msg()
-        .emoji(CE_ERROR, "❌").bold(" Файл слишком большой.").nl(2)
-        .text(f"Максимальный размер: ").bold(f"{max_mb} МБ").text(".").nl()
+        .ce(CE_ERROR, "❌").bold(" Файл слишком большой.").nl(2)
+        .text("Максимальный размер: ").bold(f"{max_mb} МБ").text(".").nl()
         .text("Telegram не позволяет отправлять файлы большего размера.")
-        .build()
+        .out()
     )
 
 
 def msg_private() -> dict:
     return (
         Msg()
-        .emoji(CE_ERROR, "❌").bold(" Недоступный контент.").nl(2)
-        .text("Видео приватное или было удалено. Попробуй другую ссылку.")
-        .build()
+        .ce(CE_ERROR, "❌").bold(" Недоступный контент.").nl(2)
+        .text("Видео приватное или удалено. Попробуй другую ссылку.")
+        .out()
     )
 
 
 def msg_error() -> dict:
     return (
         Msg()
-        .emoji(CE_ERROR, "❌").bold(" Ошибка при скачивании.").nl(2)
-        .text("Не удалось скачать контент. Возможные причины:").nl()
+        .ce(CE_ERROR, "❌").bold(" Ошибка при скачивании.").nl(2)
+        .text("Возможные причины:").nl()
         .text("Неверная или устаревшая ссылка").nl()
         .text("TikTok временно недоступен").nl()
         .text("Приватное видео").nl(2)
-        .text("Попробуй ещё раз или проверь ссылку.")
-        .build()
+        .text("Попробуй ещё раз или пришли другую ссылку.")
+        .out()
     )
 
 
-# ══════════════════════════════════════════════
-# БЛОК 4: Inline-клавиатура и хранение ссылок
-# ══════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════
+# БЛОК 4 — Валидация TikTok URL
+# ══════════════════════════════════════════════════════════
 
-# Временное хранилище: ключ → URL
-# key = f"{user_id}:{message_id}" — уникален для каждого запроса
-_url_cache: dict[str, str] = {}
-
-
-def make_keyboard(key: str) -> InlineKeyboardMarkup:
-    """Кнопки выбора формата для скачивания."""
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="Video  .mp4",  callback_data=f"video:{key}"),
-        InlineKeyboardButton(text="Audio  .mp3",  callback_data=f"audio:{key}"),
-        InlineKeyboardButton(text="Cancel",       callback_data=f"cancel:{key}"),
-    ]])
-
-
-# ══════════════════════════════════════════════
-# БЛОК 5: Валидация TikTok URL
-# ══════════════════════════════════════════════
-
-TIKTOK_RE = re.compile(
+_TIKTOK_RE = re.compile(
     r"https?://(www\.|vm\.|vt\.|m\.)?tiktok\.com/[\w@/\-?=&%.]+",
     re.IGNORECASE,
 )
 
 
 def is_tiktok(text: str) -> bool:
-    return bool(TIKTOK_RE.search(text.strip()))
+    return bool(_TIKTOK_RE.search(text.strip()))
 
 
-def extract_tiktok_url(text: str) -> str | None:
-    m = TIKTOK_RE.search(text.strip())
+def extract_url(text: str) -> str | None:
+    m = _TIKTOK_RE.search(text.strip())
     return m.group(0) if m else None
 
 
-# ══════════════════════════════════════════════
-# БЛОК 6: Очистка временных файлов
-# ══════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════
+# БЛОК 5 — Утилиты
+# ══════════════════════════════════════════════════════════
 
-def cleanup_dir(directory: Path) -> None:
+def cleanup(path: Path) -> None:
+    """Удаляет директорию со всем содержимым (игнорирует ошибки)."""
     try:
-        if directory.exists():
-            shutil.rmtree(directory)
+        if path.exists():
+            shutil.rmtree(path)
     except Exception as e:
-        logger.warning(f"Не удалось удалить {directory}: {e}")
+        logger.warning(f"Не удалось удалить {path}: {e}")
 
 
-# ══════════════════════════════════════════════
-# БЛОК 7: Скачивание через yt-dlp
-# ══════════════════════════════════════════════
+def make_zip(files: list[Path], out: Path) -> Path:
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
+        for f in files:
+            zf.write(f, f.name)
+    return out
+
 
 def _ffmpeg_dir() -> str:
-    """Директория ffmpeg для yt-dlp."""
     return str(Path(FFMPEG_PATH).parent)
 
 
-def get_video_opts(output_dir: Path) -> dict:
-    """Настройки yt-dlp для видео без водяного знака."""
-    return {
-        "outtmpl": str(output_dir / "%(title).50s.%(ext)s"),
-        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-        "postprocessors": [{"key": "FFmpegVideoConvertor", "preferedformat": "mp4"}],
-        "ffmpeg_location": _ffmpeg_dir(),
-        "extractor_args": {
-            "tiktok": {
-                "api_hostname": ["api22-normal-c-alisg.tiktokv.com"],
-                "app_version": ["26.1.3"],
-            }
-        },
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "writeinfojson": True,
-    }
+# ══════════════════════════════════════════════════════════
+# БЛОК 6 — Скачивание через yt-dlp
+#
+# Две независимые функции: video/images и audio.
+# Запускаются параллельно через asyncio.gather.
+# Каждая работает в своей поддиректории, чтобы
+# файлы не пересекались.
+# ══════════════════════════════════════════════════════════
 
-
-def get_audio_opts(output_dir: Path) -> dict:
-    """Настройки yt-dlp для извлечения аудио → MP3 192kbps."""
+def _ydl_base_opts(out_dir: Path, outtmpl: str | None = None) -> dict:
+    """Общие опции yt-dlp."""
     return {
-        "outtmpl": str(output_dir / "%(title).50s.%(ext)s"),
-        "format": "bestaudio/best",
-        "postprocessors": [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": "192",
-        }],
+        "outtmpl": outtmpl or str(out_dir / "%(title).50s.%(ext)s"),
         "ffmpeg_location": _ffmpeg_dir(),
         "extractor_args": {
             "tiktok": {
@@ -531,18 +449,24 @@ def get_audio_opts(output_dir: Path) -> dict:
     }
 
 
-async def download_video(url: str, work_dir: Path) -> dict:
+async def fetch_video(url: str, work_dir: Path) -> dict:
     """
-    Скачивает видео или карусель изображений.
+    Скачивает видео (MP4 без водяного знака) или карусель изображений (ZIP).
 
     Возвращает:
         { "type": "video"|"images", "files": [Path, ...], "title": str }
     """
+    vid_dir = work_dir / "video"
+    vid_dir.mkdir()
     loop = asyncio.get_event_loop()
 
     def _run() -> dict:
-        opts = get_video_opts(work_dir)
-
+        opts = {
+            **_ydl_base_opts(vid_dir),
+            "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            "postprocessors": [{"key": "FFmpegVideoConvertor", "preferedformat": "mp4"}],
+            "writeinfojson": True,
+        }
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
             if not info:
@@ -559,87 +483,82 @@ async def download_video(url: str, work_dir: Path) -> dict:
             )
 
             if is_carousel and entries:
-                # Скачиваем каждый слайд карусели отдельно
+                # Карусель — скачиваем каждый слайд в отдельный файл
                 files: list[Path] = []
                 for i, entry in enumerate(entries):
-                    entry_url = entry.get("url") or entry.get("webpage_url")
-                    if not entry_url:
+                    eurl = entry.get("url") or entry.get("webpage_url")
+                    if not eurl:
                         continue
-                    sub_opts = {**opts, "outtmpl": str(work_dir / f"img_{i:03d}.%(ext)s")}
-                    with yt_dlp.YoutubeDL(sub_opts) as sub:
-                        sub.download([entry_url])
-                    for f in sorted(work_dir.glob(f"img_{i:03d}.*")):
+                    sub = {**opts, "outtmpl": str(vid_dir / f"img_{i:03d}.%(ext)s")}
+                    with yt_dlp.YoutubeDL(sub) as s:
+                        s.download([eurl])
+                    for f in sorted(vid_dir.glob(f"img_{i:03d}.*")):
                         if not f.name.endswith(".json"):
-                            files.append(f)
-                            break
+                            files.append(f); break
                 return {"type": "images", "files": files, "title": title}
 
             # Обычное видео
             ydl.download([url])
-            video_files = [
-                f for f in sorted(work_dir.glob("*.mp4"))
-                if not f.name.endswith(".json")
-            ] or [
-                f for f in sorted(work_dir.iterdir())
-                if f.is_file() and f.suffix in (".mp4", ".webm", ".mkv", ".mov")
-            ]
-            if not video_files:
+            mp4s = [f for f in sorted(vid_dir.glob("*.mp4")) if not f.name.endswith(".json")]
+            if not mp4s:
+                mp4s = [f for f in sorted(vid_dir.iterdir())
+                        if f.is_file() and f.suffix in (".mp4", ".webm", ".mkv", ".mov")]
+            if not mp4s:
                 raise FileNotFoundError("Видеофайл не найден")
-            return {"type": "video", "files": [video_files[0]], "title": title}
+            return {"type": "video", "files": [mp4s[0]], "title": title}
 
     return await loop.run_in_executor(None, _run)
 
 
-async def download_audio(url: str, work_dir: Path) -> dict:
+async def fetch_audio(url: str, work_dir: Path) -> dict:
     """
-    Извлекает аудио из TikTok поста → MP3.
+    Извлекает аудио из TikTok поста → MP3 192 kbps.
 
     Возвращает:
         { "type": "audio", "files": [Path], "title": str }
     """
+    aud_dir = work_dir / "audio"
+    aud_dir.mkdir()
     loop = asyncio.get_event_loop()
 
     def _run() -> dict:
-        opts = get_audio_opts(work_dir)
+        opts = {
+            **_ydl_base_opts(aud_dir),
+            "format": "bestaudio/best",
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            }],
+        }
         with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+            info  = ydl.extract_info(url, download=False)
             title = (info or {}).get("title", "tiktok_audio")
             ydl.download([url])
 
-        mp3_files = sorted(work_dir.glob("*.mp3"))
-        if not mp3_files:
-            # Fallback: любой аудиофайл
-            mp3_files = [
-                f for f in sorted(work_dir.iterdir())
-                if f.is_file() and f.suffix in (".mp3", ".m4a", ".aac", ".ogg", ".opus")
-            ]
-        if not mp3_files:
-            raise FileNotFoundError("Аудиофайл не найден после скачивания")
-        return {"type": "audio", "files": [mp3_files[0]], "title": title}
+        mp3s = sorted(aud_dir.glob("*.mp3"))
+        if not mp3s:
+            mp3s = [f for f in sorted(aud_dir.iterdir())
+                    if f.is_file() and f.suffix in (".mp3", ".m4a", ".aac", ".opus", ".ogg")]
+        if not mp3s:
+            raise FileNotFoundError("Аудиофайл не найден")
+        return {"type": "audio", "files": [mp3s[0]], "title": title}
 
     return await loop.run_in_executor(None, _run)
 
 
-def make_zip(files: list[Path], output: Path) -> Path:
-    """Создаёт ZIP-архив из списка файлов."""
-    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as zf:
-        for f in files:
-            zf.write(f, f.name)
-    return output
+# ══════════════════════════════════════════════════════════
+# БЛОК 7 — Инициализация бота
+# ══════════════════════════════════════════════════════════
 
-
-# ══════════════════════════════════════════════
-# БЛОК 8: Инициализация бота
-# ══════════════════════════════════════════════
-
-# parse_mode НЕ задаём: форматирование идёт через entities
+# parse_mode НЕ задаём — всё форматирование через entities
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties())
 dp  = Dispatcher()
 
 
-# ══════════════════════════════════════════════
-# БЛОК 9: Хендлеры команд
-# ══════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════
+# БЛОК 8 — Хендлеры команд
+# ══════════════════════════════════════════════════════════
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message) -> None:
@@ -652,177 +571,131 @@ async def cmd_help(message: Message) -> None:
     await message.answer(**msg_help(MAX_FILE_SIZE_MB))
 
 
-# ══════════════════════════════════════════════
-# БЛОК 10: Хендлер входящих ссылок
-# ══════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════
+# БЛОК 9 — Основной хендлер: параллельное скачивание
+#
+# Флоу:
+#   1. Получили ссылку → валидация
+#   2. Отправили "Скачиваю..."
+#   3. asyncio.gather(fetch_video, fetch_audio) — параллельно
+#   4. Отправили все файлы (видео/ZIP + MP3)
+#   5. Удалили сообщение "Скачиваю..."
+#   6. finally: cleanup всей рабочей директории
+# ══════════════════════════════════════════════════════════
 
 @dp.message(F.text)
-async def handle_url(message: Message) -> None:
-    """
-    Получает TikTok-ссылку, сохраняет в кэш и
-    показывает inline-клавиатуру выбора формата.
-    """
+async def handle_link(message: Message) -> None:
     text = message.text.strip()
 
     if not is_tiktok(text):
         await message.answer(**msg_not_tiktok())
         return
 
-    url = extract_tiktok_url(text)
-    key = f"{message.from_user.id}:{message.message_id}"
-    _url_cache[key] = url
+    url     = extract_url(text)
+    uid     = message.from_user.id
+    work    = TEMP_DIR / f"u{uid}_{message.message_id}"
+    work.mkdir(parents=True, exist_ok=True)
 
-    logger.info(f"[{message.from_user.id}] URL сохранён: {url}")
-    await message.answer(**msg_choose_format(), reply_markup=make_keyboard(key))
-
-
-# ══════════════════════════════════════════════
-# БЛОК 11: Callback — обработка выбора формата
-# ══════════════════════════════════════════════
-
-async def _send_result(
-    callback: CallbackQuery,
-    action: str,
-    url: str,
-    work_dir: Path,
-) -> None:
-    """
-    Скачивает и отправляет файл пользователю.
-    Вся логика вынесена сюда, чтобы хендлер был чистым.
-    """
-    user_id = callback.from_user.id
+    logger.info(f"[{uid}] Запрос: {url}")
+    status = await message.answer(**msg_downloading())
 
     try:
-        if action == "audio":
-            result = await download_audio(url, work_dir)
+        # Параллельно скачиваем видео/изображения и аудио
+        video_res, audio_res = await asyncio.gather(
+            fetch_video(url, work),
+            fetch_audio(url, work),
+            return_exceptions=True,
+        )
+
+        sent_any = False  # флаг: удалось отправить хоть что-то
+
+        # ── Видео или карусель ────────────────────────────
+        if isinstance(video_res, Exception):
+            logger.error(f"[{uid}] fetch_video: {video_res}")
         else:
-            result = await download_video(url, work_dir)
+            vtype  = video_res["type"]
+            vfiles = video_res["files"]
+            vtitle = video_res["title"]
 
-        content_type = result["type"]
-        files        = result["files"]
-        title        = result["title"]
+            if vtype == "video":
+                vpath = vfiles[0]
+                if vpath.stat().st_size > MAX_FILE_SIZE_BYTES:
+                    await message.answer(**msg_too_large(MAX_FILE_SIZE_MB))
+                else:
+                    await message.answer_video(
+                        video=FSInputFile(vpath, filename=f"{vtitle[:50]}.mp4"),
+                        supports_streaming=True,
+                        **msg_done_video(),
+                    )
+                    sent_any = True
+                    logger.info(f"[{uid}] Видео {vpath.stat().st_size / 1048576:.1f} МБ")
 
-        # ── Видео ────────────────────────────────────
-        if content_type == "video":
-            path = files[0]
-            if path.stat().st_size > MAX_FILE_SIZE_BYTES:
-                await callback.message.answer(**msg_too_large(MAX_FILE_SIZE_MB))
-                return
-            done = msg_done_video()
-            await callback.message.answer_video(
-                video=FSInputFile(path, filename=f"{title[:50]}.mp4"),
-                caption=done["text"],
-                caption_entities=done["entities"],
-                supports_streaming=True,
-            )
-            logger.info(f"[{user_id}] Видео отправлено ({path.stat().st_size / 1024 / 1024:.1f} МБ)")
+            elif vtype == "images" and vfiles:
+                zip_path = work / f"{vtitle[:40]}_photos.zip"
+                make_zip(vfiles, zip_path)
+                if zip_path.stat().st_size > MAX_FILE_SIZE_BYTES:
+                    await message.answer(**msg_too_large(MAX_FILE_SIZE_MB))
+                else:
+                    await message.answer_document(
+                        document=FSInputFile(zip_path, filename=f"{vtitle[:40]}_photos.zip"),
+                        **msg_done_images(),
+                    )
+                    sent_any = True
+                    logger.info(f"[{uid}] ZIP {len(vfiles)} фото")
 
-        # ── Аудио ────────────────────────────────────
-        elif content_type == "audio":
-            path = files[0]
-            if path.stat().st_size > MAX_FILE_SIZE_BYTES:
-                await callback.message.answer(**msg_too_large(MAX_FILE_SIZE_MB))
-                return
-            done = msg_done_audio()
-            await callback.message.answer_audio(
-                audio=FSInputFile(path, filename=f"{title[:50]}.mp3"),
-                caption=done["text"],
-                caption_entities=done["entities"],
-                title=title[:64],
-            )
-            logger.info(f"[{user_id}] Аудио отправлено ({path.stat().st_size / 1024 / 1024:.1f} МБ)")
-
-        # ── Карусель изображений ─────────────────────
-        elif content_type == "images":
-            if not files:
-                raise ValueError("Пустой список изображений")
-            zip_path = work_dir / f"{title[:40]}_photos.zip"
-            make_zip(files, zip_path)
-            if zip_path.stat().st_size > MAX_FILE_SIZE_BYTES:
-                await callback.message.answer(**msg_too_large(MAX_FILE_SIZE_MB))
-                return
-            done = msg_done_images()
-            await callback.message.answer_document(
-                document=FSInputFile(zip_path, filename=f"{title[:40]}_photos.zip"),
-                caption=done["text"],
-                caption_entities=done["entities"],
-            )
-            logger.info(f"[{user_id}] ZIP отправлен ({len(files)} фото)")
-
-    except yt_dlp.utils.DownloadError as e:
-        err = str(e).lower()
-        logger.error(f"[{user_id}] DownloadError: {e}")
-        if any(kw in err for kw in ("private", "login", "age")):
-            await callback.message.answer(**msg_private())
+        # ── Аудио ─────────────────────────────────────────
+        if isinstance(audio_res, Exception):
+            logger.error(f"[{uid}] fetch_audio: {audio_res}")
         else:
-            await callback.message.answer(**msg_error())
+            apath  = audio_res["files"][0]
+            atitle = audio_res["title"]
+            if apath.stat().st_size > MAX_FILE_SIZE_BYTES:
+                await message.answer(**msg_too_large(MAX_FILE_SIZE_MB))
+            else:
+                await message.answer_audio(
+                    audio=FSInputFile(apath, filename=f"{atitle[:50]}.mp3"),
+                    title=atitle[:64],
+                    **msg_done_audio(),
+                )
+                sent_any = True
+                logger.info(f"[{uid}] Аудио {apath.stat().st_size / 1048576:.1f} МБ")
 
-    except FileNotFoundError as e:
-        logger.error(f"[{user_id}] FileNotFoundError: {e}")
-        await callback.message.answer(**msg_error())
+        # ── Если оба упали — показываем ошибку ────────────
+        if not sent_any:
+            err = video_res if isinstance(video_res, Exception) else audio_res
+            err_s = str(err).lower()
+            if any(kw in err_s for kw in ("private", "login", "age")):
+                await message.answer(**msg_private())
+            else:
+                await message.answer(**msg_error())
 
     except Exception as e:
-        logger.exception(f"[{user_id}] Ошибка: {e}")
-        await callback.message.answer(**msg_error())
+        logger.exception(f"[{uid}] Неожиданная ошибка: {e}")
+        await message.answer(**msg_error())
 
     finally:
-        cleanup_dir(work_dir)
+        # Удаляем статус-сообщение и все временные файлы
+        try:
+            await status.delete()
+        except Exception:
+            pass
+        cleanup(work)
+        logger.debug(f"[{uid}] Очищена {work}")
 
 
-@dp.callback_query(F.data.startswith("cancel:"))
-async def cb_cancel(callback: CallbackQuery) -> None:
-    """Пользователь нажал Cancel — удаляем сообщение с кнопками."""
-    key = callback.data.split(":", 1)[1]
-    _url_cache.pop(key, None)
-    await callback.message.delete()
-    await callback.answer()
-
-
-@dp.callback_query(F.data.regexp(r"^(video|audio):"))
-async def cb_download(callback: CallbackQuery) -> None:
-    """
-    Пользователь выбрал формат → скачиваем и отправляем.
-    """
-    action, key = callback.data.split(":", 1)
-    url = _url_cache.pop(key, None)
-
-    if not url:
-        await callback.answer("Ссылка устарела. Отправь снова.", show_alert=True)
-        await callback.message.delete()
-        return
-
-    user_id  = callback.from_user.id
-    msg_id   = callback.message.message_id
-    work_dir = TEMP_DIR / f"user_{user_id}_{msg_id}"
-    work_dir.mkdir(parents=True, exist_ok=True)
-
-    # Редактируем сообщение с кнопками → "Скачиваю..."
-    dl = msg_downloading(action)
-    await callback.message.edit_text(text=dl["text"], entities=dl["entities"])
-    await callback.answer()
-
-    await _send_result(callback, action, url, work_dir)
-
-    # Удаляем сообщение "Скачиваю..." (оно уже не нужно)
-    try:
-        await callback.message.delete()
-    except Exception:
-        pass
-
-
-# ══════════════════════════════════════════════
-# БЛОК 12: Точка входа
-# ══════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════
+# БЛОК 10 — Точка входа
+# ══════════════════════════════════════════════════════════
 
 async def main() -> None:
     ensure_ffmpeg()
 
-    logger.info("=" * 52)
-    logger.info("  TikTok Downloader Bot запускается")
+    logger.info("=" * 54)
+    logger.info("  TikTok Downloader Bot")
     logger.info(f"  FFmpeg   : {FFMPEG_PATH}")
     logger.info(f"  Temp dir : {TEMP_DIR.resolve()}")
     logger.info(f"  Max size : {MAX_FILE_SIZE_MB} МБ")
-    logger.info("=" * 52)
+    logger.info("=" * 54)
 
     await bot.delete_webhook(drop_pending_updates=True)
     try:

@@ -1,0 +1,40 @@
+# ─────────────────────────────────────────────
+# TikTok Downloader Bot — зависимости
+# Установка: pip install -r requirements.txt
+# ─────────────────────────────────────────────
+
+# Telegram Bot Framework (async)
+aiogram==3.13.1
+
+# Загрузчик видео и медиа (поддержка TikTok)
+yt-dlp>=2024.11.18
+
+# Загрузка переменных окружения из .env
+python-dotenv>=1.0.0
+
+# FFmpeg Python-обёртка (для постобработки видео)
+ffmpeg-python>=0.2.0
+
+# Асинхронные HTTP-запросы (используется aiogram внутри)
+aiohttp>=3.9.0
+
+# Типизация (совместимость с Python 3.10+)
+typing_extensions>=4.9.0
+
+# ─────────────────────────────────────────────
+# ПРИМЕЧАНИЕ про FFmpeg:
+#
+# Если на хостинге нет системного ffmpeg —
+# бот скачает статический бинарник автоматически
+# при первом запуске (в ./bin/ffmpeg).
+#
+# Поддерживаемые платформы автоустановки:
+#   • Linux x86_64  (большинство VPS)
+#   • Linux aarch64 (ARM, Oracle Free Tier)
+#   • Windows x64   (локальная разработка)
+#
+# Для ручной установки:
+#   Ubuntu/Debian:  sudo apt install ffmpeg
+#   macOS:          brew install ffmpeg
+#   Windows:        https://ffmpeg.org/download.html
+# ─────────────────────────────────────────────

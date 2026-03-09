@@ -6,35 +6,30 @@
 # Telegram Bot Framework (async)
 aiogram==3.13.1
 
-# Загрузчик видео и медиа (поддержка TikTok)
+# Загрузчик видео/аудио/изображений
 yt-dlp>=2024.11.18
 
 # Загрузка переменных окружения из .env
 python-dotenv>=1.0.0
 
-# FFmpeg Python-обёртка (для постобработки видео)
+# FFmpeg Python-обёртка (для постобработки)
 ffmpeg-python>=0.2.0
 
-# Асинхронные HTTP-запросы (используется aiogram внутри)
+# Асинхронные HTTP-запросы (внутри aiogram)
 aiohttp>=3.9.0
 
-# Типизация (совместимость с Python 3.10+)
-typing_extensions>=4.9.0
-
 # ─────────────────────────────────────────────
-# ПРИМЕЧАНИЕ про FFmpeg:
+# FFmpeg (системная утилита — не Python-пакет):
 #
-# Если на хостинге нет системного ffmpeg —
-# бот скачает статический бинарник автоматически
-# при первом запуске (в ./bin/ffmpeg).
+# Бот ищет ffmpeg в таком порядке:
+#   1. FFMPEG_PATH= в .env
+#   2. Системный PATH
+#   3. ./bin/ffmpeg (кэш прошлого запуска)
+#   4. Авто-загрузка статического бинарника
+#      → ./bin/ffmpeg (без root, без apt)
 #
-# Поддерживаемые платформы автоустановки:
-#   • Linux x86_64  (большинство VPS)
-#   • Linux aarch64 (ARM, Oracle Free Tier)
-#   • Windows x64   (локальная разработка)
-#
-# Для ручной установки:
-#   Ubuntu/Debian:  sudo apt install ffmpeg
-#   macOS:          brew install ffmpeg
-#   Windows:        https://ffmpeg.org/download.html
+# Ручная установка при необходимости:
+#   Ubuntu/Debian : sudo apt install ffmpeg
+#   macOS         : brew install ffmpeg
+#   Windows       : https://ffmpeg.org/download.html
 # ─────────────────────────────────────────────
